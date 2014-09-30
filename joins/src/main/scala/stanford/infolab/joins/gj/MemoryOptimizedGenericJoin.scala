@@ -19,24 +19,30 @@ import org.apache.spark.Partitioner
 class MemoryOptimizedGenericJoin(joinsArgs: JoinsArguments) extends BaseGenericJoin(joinsArgs) {
 
   override def computeQuery(sc: SparkContext): RDD[_] = {    
-    val startTime = System.currentTimeMillis();
-    var relations =  parseEdgesIntoRDDFromEdgeListFormat(sc);
+    val startTime = System.currentTimeMillis()
+    val relations =  parseEdgesIntoRDDFromEdgeListFormat(sc)
+    relations.cache()
+    relations.count()
     debugRelation(relations)
     var succ = computeSUCC_A0(relations)
-    debugRelation(succ);
-    val n = joinsArgs.schemas.flatMap{ a => Seq(a._1, a._2) }.distinct.length;
+    debugRelation(succ)
+    val n = joinsArgs.schemas.flatMap{ a => Seq(a._1, a._2) }.distinct.length
     log.debug("numAttributes: " + n)
-    for (nextAttribute <- 1 to n-1) {
+    var nextAttribute = 1
+    while (nextAttribute < n) {
       log.info("Computing next succ for attribute: " + nextAttribute)
-      succ = computeNextSucc(relations, succ, nextAttribute.toByte);
+      succ = computeNextSucc(relations, succ, nextAttribute.toByte)
       debugRelation(succ)
+      nextAttribute += 1
     }
     val finalOutput = succ.flatMap(partIDTuples => {
       val tuples = partIDTuples._2
       val numTuples = tuples.length / n
       val outputs = new ArrayBuffer[(Int, ArrayBuffer[Int])](numTuples)
-      for (i <- 0 to numTuples - 1) {
+      var i = 0
+      while (i < numTuples) {
         outputs += ((tuples(i * n), tuples.slice(i * n, (i + 1) * n)))
+        i += 1
       }
       outputs
     })
@@ -48,7 +54,7 @@ class MemoryOptimizedGenericJoin(joinsArgs: JoinsArguments) extends BaseGenericJ
   def computeNextSucc(relations: RDD[(Short, RelationPartition)], 
     succ: RDD[(Short, ArrayBuffer[Int])], nextAttribute: Byte) : RDD[(Short, ArrayBuffer[Int])] = {
     // TODO(semih): Change this to forEachRelationAttributesToConditionOn(nextAttribute)
-    val relationConditionedAttributesMap = findForEachRelationAttributeToCondition(nextAttribute);
+    val relationConditionedAttributesMap = findForEachRelationAttributeToCondition(nextAttribute)
     var numRelationsWithNonEmptyConditions = 0
     for (attributesToConditionOn <- relationConditionedAttributesMap) {
       if (!attributesToConditionOn.isEmpty) numRelationsWithNonEmptyConditions += 1
@@ -72,17 +78,19 @@ class MemoryOptimizedGenericJoin(joinsArgs: JoinsArguments) extends BaseGenericJ
     debugRelation(intersections)
     // TODO(semih): We can run this for loop only numRelsWithCondAttributes - 1 times
     // And in the last time just return the final successful tuples after the final intersection
-    for (i <- 0 to numRelationsWithNonEmptyConditions - 1) {
-      val relationsIntMsgsCogrouped = relations.cogroup(intersections, joinsArgs.reduceParallelism);
+    var i = 0
+    while (i < numRelationsWithNonEmptyConditions) {
+      val relationsIntMsgsCogrouped = relations.cogroup(intersections, joinsArgs.reduceParallelism)
       relationsIntMsgsCogrouped.setName("RELATIONS_INTERSECTION_MESSAGES_COGROUPED_FOR_NEXT_ATTR_" 
         + nextAttribute + "_" + i)
       debugRelation(relationsIntMsgsCogrouped)
       intersections = computeNextIntersections(relationsIntMsgsCogrouped,
         nextAttribute, relationConditionedAttributesMap, numRelationsWithNonEmptyConditions, i)
       debugRelation(intersections)
+      i += 1
     }
 
-    // We perform a cartesianproduct of tuple with extensions
+    // We perform a cartesian product of tuple with extensions
     val nextSucc = intersections.groupByKey(joinsArgs.reduceParallelism).flatMap(partIDIntersectionMsgs => {
         val partitionID = partIDIntersectionMsgs._1
         val intersectionMsgs = partIDIntersectionMsgs._2
@@ -123,14 +131,13 @@ class MemoryOptimizedGenericJoin(joinsArgs: JoinsArguments) extends BaseGenericJ
           val intersectionMsgs = partIDPartitionIntMsgs._2._2
           val intersectionMesssagesToEachPartition = new IntersectionMessagesToEachPartition(
             joinsArgs.numPartitions)
-          val stepSize = nextAttribute
           var beginIntersectionOffset: Int = -1
           var endIntersectionOffset: Int = -1
-          for (intersectionMsg <- intersectionMsgs) {
+          intersectionMsgs.foreach { intersectionMsg =>
             var t = 0
             val succTuples = intersectionMsg.succTuples
-            var succTupleFirstAttrIndex: Int = -1;
-            var succTupleEndIndex: Int = -1;
+            var succTupleFirstAttrIndex: Int = -1
+            var succTupleEndIndex: Int = -1
             val currentIntersections = intersectionMsg.intersections
             val intersectionOffsets = intersectionMsg.offsets
             val startRelationIDs = intersectionMsg.startRelationIDs
@@ -139,7 +146,6 @@ class MemoryOptimizedGenericJoin(joinsArgs: JoinsArguments) extends BaseGenericJ
             var currentIntersectingAttributeVal: Int = -1
             var currentIntersectionRelation: Byte = -1
             var nextIntersectingAttributeVal: Int = -1
-            var conditionedAttribute: Byte = -1
             while (t < numTuples) {
               currentIntersectingAttributeVal = -1
               nextIntersectingAttributeVal = -1
@@ -162,7 +168,7 @@ class MemoryOptimizedGenericJoin(joinsArgs: JoinsArguments) extends BaseGenericJ
               for (relIndex <- 0 to joinsArgs.schemas.length - 1) {
                 if (relIndex != startRelationID &&
                   !relationConditionedAttributesMap(relIndex).isEmpty) {
-                  count += 1;
+                  count += 1
                   if (count == extensionRoundNo) {
                     val condAttrIndex = relationConditionedAttributesMap(relIndex)(0)
                     currentIntersectingAttributeVal = succTuples(
@@ -199,7 +205,7 @@ class MemoryOptimizedGenericJoin(joinsArgs: JoinsArguments) extends BaseGenericJ
                 if (joinsArgs.countMotifsOnce) {
                   beginValIndexToPass = binarySearchIndexWithMinValueGreaterThanX(
                     relationPartition.values, beginValIndOffset, endValIndOffset-1,
-                    succTuples(succTupleEndIndex-1));
+                    succTuples(succTupleEndIndex-1))
                 }
                 intersectionMesssagesToEachPartition.addTuple(nextIntersectingAttributeVal,
                   succTuples, succTupleFirstAttrIndex, succTupleEndIndex, relationPartition.values,
@@ -252,6 +258,7 @@ class MemoryOptimizedGenericJoin(joinsArgs: JoinsArguments) extends BaseGenericJ
         val indices = new ArrayBuffer[ArrayBuffer[Int]](joinsArgs.numPartitions)
         for (i <- 0 to joinsArgs.numPartitions - 1) {
           indices += new ArrayBuffer[Int](joinsArgs.schemas.length)
+
           for (j <- 0 to joinsArgs.schemas.length - 1) {
             indices(i) += 0
           }
@@ -263,25 +270,24 @@ class MemoryOptimizedGenericJoin(joinsArgs: JoinsArguments) extends BaseGenericJ
         val stepSize = nextAttribute
         var attributeVal = -1
         var partitionIDOfAttr: Short = -1
-        var minOfferRelationID: Byte = -1;
+        var minOfferRelationID: Byte = -1
         var minAttributeVal = -1
-        var minOffer: Int = -1;
-        var offer: Int = -1;
+        var minOffer: Int = -1
+        var offer: Int = -1
         var indexToOffer: Int = -1
         var attributesToConditionOn: ArrayBuffer[Byte] = null
         val intersectionMesssagesToEachPartition = new IntersectionMessagesToEachPartition(
           joinsArgs.numPartitions)
-        var succTupleFirstAttrIndex: Int = -1
-        var succTupleEndIndex: Int = -1
         var firstRelation: Boolean = true
-        var i = 0;
+        var i = 0
         while (i < numTuples) {
-          succTupleFirstAttrIndex = i * nextAttribute
-          succTupleEndIndex = (i+1) * nextAttribute
+          val succTupleFirstAttrIndex = i * nextAttribute
+          val succTupleEndIndex = (i+1) * nextAttribute
           log.debug("succTupleFirstAttrIndex: " + succTupleFirstAttrIndex +
             " succTupleEndIndex: " + succTupleEndIndex)
           firstRelation = true
-          for (relationID <- 0 to relationConditionedAttributesMap.length - 1) {
+          var relationID = 0
+          while (relationID < relationConditionedAttributesMap.length) {
             attributesToConditionOn = relationConditionedAttributesMap(relationID)
             log.debug("attributesToConditionOn for relationID: " + relationID + " :"
               + attributesToConditionOn)
@@ -303,6 +309,7 @@ class MemoryOptimizedGenericJoin(joinsArgs: JoinsArguments) extends BaseGenericJ
                 minAttributeVal = attributeVal
               }
             }
+            relationID += 1
           }
           log.debug("for tuple: " + succTuples.slice(succTupleFirstAttrIndex, succTupleEndIndex)
             + " minOffer: " + minOffer + " minOfferRelationID: " + minOfferRelationID)
@@ -348,24 +355,28 @@ class MemoryOptimizedGenericJoin(joinsArgs: JoinsArguments) extends BaseGenericJ
         var countOffer = -1
         val outputs = new ArrayBuffer[(Short, (Short, ArrayBuffer[ArrayBuffer[Int]]))](
           joinsArgs.numPartitions)
-        for (i <- 0 to joinsArgs.numPartitions - 1) {
+        var i = 0
+        while (i < joinsArgs.numPartitions) {
           outputs += ((i.toShort, (partitionID, null)))
+          i += 1
         }
 
-        for (elem <- requests) {
+        requests.foreach { elem =>
           val srcPartitionID = elem._1
           val requestArray = elem._2
           val offersToSrcPartition = new ArrayBuffer[ArrayBuffer[Int]](requestArray.length)
-          outputs(srcPartitionID) = ((srcPartitionID.toShort, (partitionID, offersToSrcPartition)))
-          for (relID <- 0 to requestArray.length - 1) {
+          outputs(srcPartitionID) = (srcPartitionID.toShort, (partitionID, offersToSrcPartition))
+          var relID = 0
+          while (relID < requestArray.length) {
             val offerToSrcPartition = new ArrayBuffer[Int](requestArray(relID).length)
             offersToSrcPartition += offerToSrcPartition
-            for (attributeVal <- requestArray(relID)) {
+            requestArray(relID).foreach { attributeVal =>
               val offerSize = partition.getCountOffer(attributeVal, relID.toByte)
               log.debug("partitionID: " + srcPartitionID + " is asking for countOffer. attributeVal: "
                 + attributeVal + " relID: " + relID + " fromPartitionID: " + partitionID)
-              offerToSrcPartition += offerSize;
+              offerToSrcPartition += offerSize
             }
+            relID += 1
           }
         }
         outputs
@@ -382,31 +393,37 @@ class MemoryOptimizedGenericJoin(joinsArgs: JoinsArguments) extends BaseGenericJ
     val countRequests = succ.flatMap(partitionIDTuples => {
       val partitionID = partitionIDTuples._1
       val tuples = partitionIDTuples._2
-      val numAttrInSuccTuples = nextAttribute;
+      val numAttrInSuccTuples = nextAttribute
       val requestsForEachPartition = new ArrayBuffer[ArrayBuffer[ArrayBuffer[Int]]](
         joinsArgs.numPartitions)
-      for (i <- 0 to joinsArgs.numPartitions-1) {
+      var i = 0
+      while (i < joinsArgs.numPartitions) {
         requestsForEachPartition += new ArrayBuffer[ArrayBuffer[Int]](joinsArgs.schemas.length)
-        for (j <- 0 to joinsArgs.schemas.length - 1) {
+        var j = 0
+        while (j < joinsArgs.schemas.length) {
           requestsForEachPartition(i) += new ArrayBuffer[Int]()
+          j += 1
         }
+        i += 1
       }
       val numTuples = tuples.length/numAttrInSuccTuples
-      var attributeToConditionOn = -1;
-      var attributesToConditionOn: ArrayBuffer[Byte] = null
-      for (i <- 0 to numTuples - 1) {
-        for (relationID <- 0 to relationConditionedAttributesMap.length - 1) {
-          attributesToConditionOn = relationConditionedAttributesMap(relationID)
+      i = 0
+      while (i < numTuples) {
+        var relationID = 0
+        while (relationID < relationConditionedAttributesMap.length) {
+          val attributesToConditionOn = relationConditionedAttributesMap(relationID)
           // WARNING: When we start computing non-binary queries the below if should be 
           // removed and we should condition on a set of attributes.
           if(!attributesToConditionOn.isEmpty) {
             // WARNING: Below we implicitly assume that we are always extending
             // attributes in increasing index from A0, A1, ..., Ak
-            attributeToConditionOn = tuples(i * numAttrInSuccTuples + attributesToConditionOn(0))
-            requestsForEachPartition((attributeToConditionOn % joinsArgs.numPartitions).toInt)(
+            val attributeToConditionOn = tuples(i * numAttrInSuccTuples + attributesToConditionOn(0))
+            requestsForEachPartition(attributeToConditionOn % joinsArgs.numPartitions)(
               relationID) += attributeToConditionOn
           }
+          relationID += 1
         }
+        i += 1
       }
       
       val outputs = new ArrayBuffer[(Short, (Short, ArrayBuffer[ArrayBuffer[Int]]))]()
@@ -422,14 +439,18 @@ class MemoryOptimizedGenericJoin(joinsArgs: JoinsArguments) extends BaseGenericJ
   def findForEachRelationAttributeToCondition(nextAttribute: Byte): ArrayBuffer[ArrayBuffer[Byte]] = {
     log.debug("inside findForEachRelationAttributeToCondition. nextAttribute: " + nextAttribute)
     val relAttrIndices = new ArrayBuffer[ArrayBuffer[Byte]](nextAttribute)
-    for (relIndex <- 0 to joinsArgs.schemas.length - 1) {
+    var relIndex = 0
+    while (relIndex < joinsArgs.schemas.length) {
       relAttrIndices += new ArrayBuffer[Byte]()
-      val schema = joinsArgs.schemas(relIndex.toByte);
-      for (attributeIndex <- 0 to nextAttribute - 1) {
+      val schema = joinsArgs.schemas(relIndex.toByte)
+      var attributeIndex = 0
+      while (attributeIndex < nextAttribute) {
         if (schema._1 == attributeIndex && schema._2 == nextAttribute) {
           relAttrIndices(relIndex) += attributeIndex.toByte
         }
+        attributeIndex += 1
       }
+      relIndex += 1
     }
     relAttrIndices
   }
@@ -440,7 +461,7 @@ class MemoryOptimizedGenericJoin(joinsArgs: JoinsArguments) extends BaseGenericJ
     val a0Indices = findIndices(0).sortWith(_ < _)
     val a0IndicesLength = a0Indices.length
 
-    val succ0 = relations.map(partitionIDPartition => {
+    val succ0 = relations.map { partitionIDPartition =>
       // We allocated one partition for each
       val partitionID = partitionIDPartition._1
       val intersection = ArrayBuffer[Int]()
@@ -454,12 +475,14 @@ class MemoryOptimizedGenericJoin(joinsArgs: JoinsArguments) extends BaseGenericJ
       var keyOffsetBegin = -1
       var keyOffsetEnd = -1
       var nextKeyRelation = -1
-      for (i <- 0 to keys.length - 1) {
+      var i = 0
+      while (i < keys.length) {
         keyOffsetBegin = keyBeginningOffsets(i)
         keyOffsetEnd = keyBeginningOffsets(i+1)
         nextA0RelationID = a0Indices(0)
         nextA0RelationIndex = 0
-        for (j <- keyOffsetBegin to keyOffsetEnd-1) {
+        var j = keyOffsetBegin
+        while (j < keyOffsetEnd) {
           nextKeyRelation = relIDsForEachKey(j)
           if (nextKeyRelation == nextA0RelationID) {
             if (nextA0RelationIndex+1 >= a0IndicesLength) {
@@ -472,16 +495,18 @@ class MemoryOptimizedGenericJoin(joinsArgs: JoinsArguments) extends BaseGenericJ
               nextA0RelationID = a0Indices(nextA0RelationIndex)
             }
           }
+          j += 1
         }
+        i += 1
       }
       (partitionID, intersection)
-    })
+    }
     succ0.setName("SUCC_A0")
     succ0
   }
 
   def parseEdgesIntoRDDFromEdgeListFormat(sc: SparkContext): RDD[(Short, RelationPartition)] = {
-    val timeBeforeParsing = System.currentTimeMillis();
+    val timeBeforeParsing = System.currentTimeMillis()
     var edgesRDDList = new ListBuffer[RDD[(Int, Int)]]()
     var partitionIDKeyRelIDValues: RDD[(Short, (Int, Byte, Int))] = null
 //    for (i <- 0 to joinsArgs.inputFiles.length-1) {
@@ -490,11 +515,15 @@ class MemoryOptimizedGenericJoin(joinsArgs: JoinsArguments) extends BaseGenericJ
       line => {
         val outputs = new ArrayBuffer[(Short,(Int, Byte, Int))]()
         val split = line.split("\\s+")
-        val key = split(0).toInt;
-        for (j <- 1 to split.length - 1) {
-          for (i<- 0 to joinsArgs.inputFiles.length-1) {
+        val key = split(0).toInt
+        var j = 1
+        while (j < split.length) {
+          var i = 0
+          while (i < joinsArgs.inputFiles.length) {
             outputs += (((key % joinsArgs.numPartitions).toShort, (key, i.toByte, split(j).toInt)))
+            i += 1
           }
+          j += 1
         }
         outputs
       })
