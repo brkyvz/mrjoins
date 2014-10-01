@@ -123,14 +123,14 @@ object RelationPartitionFactory {
     // as much as m*numKeys
     val relIDsForEachKey =  new ArrayBuffer[Byte](numKeys)
     keyBeginningOffsets += 0
-    for (key <- sortedKeys) {
+    sortedKeys.foreach { key =>
       val relIDVals = krvGroupedByK(key).map(krv => (krv._2, krv._3))
       val relIDValsGroupedByRelID = relIDVals.groupBy(relIDVal => relIDVal._1)
       var sortedRelIDs = new ArrayBuffer[Byte](relIDValsGroupedByRelID.keys.size)
       sortedRelIDs.appendAll(relIDValsGroupedByRelID.keys)
       sortedRelIDs = sortedRelIDs.sortWith(_ < _)
       keyBeginningOffsets += keyBeginningOffsets.last + sortedRelIDs.size
-      for (relID <- sortedRelIDs) {
+      sortedRelIDs.foreach { relID =>
         relIDsForEachKey += relID
         // offset for this key's relID is current size of the values array
         individualOffsets += values.size

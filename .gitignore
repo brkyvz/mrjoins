@@ -3,5 +3,5 @@
 *.jar
 *.idea
 data/*
-target/*
-*/target
+*.class
+
